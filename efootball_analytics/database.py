@@ -4,6 +4,7 @@ from contextlib import closing, contextmanager
 from pathlib import Path
 
 from .models import Capture, Event, Match, SubstitutionReason
+from .outbox import SCHEMA, enqueue
 
 
 class Database:
@@ -46,6 +47,14 @@ class Database:
                     ALTER TABLE captures ADD COLUMN substitution_notes TEXT
                     CHECK (substitution_notes IS NULL OR substitution_reason IS NOT NULL)
                 """)
+
+            for statement in SCHEMA:
+                connection.execute(statement)
+            historical = connection.execute("""
+                SELECT id FROM captures WHERE id NOT IN (SELECT capture_id FROM capture_sync)
+            """).fetchall()
+            for row in historical:
+                enqueue(connection, row["id"])
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -93,6 +102,7 @@ class Database:
                   capture.substitution_notes, capture.match_id))
             if result.rowcount != 1:
                 raise ValueError("Start a match before capturing.")
+            enqueue(connection, capture.id)
 
     def captures(self, match_id: str) -> list[Capture]:
         with self.connect() as connection:
@@ -114,19 +124,32 @@ class Database:
         self, capture_id: str, reason: SubstitutionReason, notes: str | None
     ) -> None:
         with self.connect() as connection:
-            result = connection.execute("""
-                UPDATE captures SET substitution_reason = ?, substitution_notes = ?
+            connection.execute("BEGIN IMMEDIATE")
+            previous = connection.execute("""
+                SELECT substitution_reason, substitution_notes FROM captures
                 WHERE id = ? AND event = 'substitution'
-            """, (reason.value, notes, capture_id))
-            if result.rowcount != 1:
+            """, (capture_id,)).fetchone()
+            if previous is None:
                 raise ValueError("Select an existing substitution capture.")
+            if tuple(previous) != (reason.value, notes):
+                connection.execute("""
+                    UPDATE captures SET substitution_reason = ?, substitution_notes = ? WHERE id = ?
+                """, (reason.value, notes, capture_id))
+                enqueue(connection, capture_id)
 
     def update_minute(self, capture_id: str, minute: str | None) -> None:
         with self.connect() as connection:
-            connection.execute("UPDATE captures SET minute = ? WHERE id = ?", (minute, capture_id))
+            result = connection.execute(
+                "UPDATE captures SET minute = ? WHERE id = ? AND minute IS NOT ?",
+                (minute, capture_id, minute),
+            )
+            if result.rowcount:
+                enqueue(connection, capture_id)
 
     @contextmanager
     def deleting_capture(self, capture_id: str) -> Iterator[bool]:
         with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            enqueue(connection, capture_id, deleted=True)
             result = connection.execute("DELETE FROM captures WHERE id = ?", (capture_id,))
             yield result.rowcount == 1

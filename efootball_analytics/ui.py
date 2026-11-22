@@ -1,8 +1,9 @@
 import logging
 from collections.abc import Callable
 from datetime import datetime
+from threading import Thread
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QFrame,
@@ -12,6 +13,7 @@ from PySide6.QtWidgets import (
 )
 
 from .config import Config, Settings
+from .datalake import DataLake
 from .hotkeys import Hotkeys
 from .models import Capture, Event, Match, SubstitutionReason
 from .sessions import Sessions
@@ -102,10 +104,15 @@ class SubstitutionDialog(QDialog):
 class Window(QMainWindow):
     shortcut_pressed = Signal(object)
 
-    def __init__(self, sessions: Sessions, config: Config) -> None:
+    def __init__(self, sessions: Sessions, config: Config, data_lake: DataLake | None = None) -> None:
         super().__init__()
         self.sessions = sessions
         self.config = config
+        self.data_lake = data_lake if data_lake is not None else DataLake(
+            sessions.database, sessions.root
+        )
+        self.sync_thread: Thread | None = None
+        self.manual_sync_requested = False
         self.settings = config.load()
         self.hotkeys = Hotkeys(self.shortcut_pressed.emit)
         self.shortcut_pressed.connect(self.capture_from_hotkey, Qt.ConnectionType.QueuedConnection)
@@ -168,6 +175,20 @@ class Window(QMainWindow):
         controls.addWidget(self.capture_minute, 2, 3)
         layout.addWidget(panel)
 
+        storage = QHBoxLayout()
+        self.sync_status = QLabel()
+        self.sync_status.setWordWrap(True)
+        storage.addWidget(self.sync_status, 1)
+        self.sync_settings = QSettings(str(sessions.root / "data-lake.ini"), QSettings.Format.IniFormat)
+        self.auto_sync = QCheckBox("Sync automatically")
+        self.auto_sync.setChecked(self.sync_settings.value("automatic", True, type=bool))
+        self.auto_sync.toggled.connect(self.set_auto_sync)
+        storage.addWidget(self.auto_sync)
+        self.sync_button = QPushButton("Sync to Data Lake")
+        self.sync_button.clicked.connect(self.request_sync)
+        storage.addWidget(self.sync_button)
+        layout.addLayout(storage)
+
         history = QHBoxLayout()
         history.addWidget(QLabel("Capture history"))
         self.match_picker = QComboBox()
@@ -215,6 +236,43 @@ class Window(QMainWindow):
         self.match_picker.currentIndexChanged.connect(self.load_history)
         self.refresh_matches()
         self.apply_shortcuts()
+        self.sync_timer = QTimer(self)
+        self.sync_timer.setInterval(2000)
+        self.sync_timer.timeout.connect(self.update_sync)
+        self.sync_timer.start()
+        self.update_sync()
+
+    def set_auto_sync(self, enabled: bool) -> None:
+        self.sync_settings.setValue("automatic", enabled)
+        self.update_sync()
+
+    def request_sync(self) -> None:
+        self.manual_sync_requested = True
+        self.sync_button.setEnabled(False)
+        self.update_sync()
+
+    def update_sync(self) -> None:
+        if self.sync_thread is None or not self.sync_thread.is_alive():
+            manual = self.manual_sync_requested
+            self.manual_sync_requested = False
+            self.sync_button.setEnabled(True)
+            self.sync_thread = Thread(
+                target=self.data_lake.run,
+                kwargs={"manual": manual, "automatic": self.auto_sync.isChecked()},
+                daemon=True, name="data-lake-sync",
+            )
+            self.sync_thread.start()
+        self.attempt(self.show_sync_status)
+
+    def show_sync_status(self) -> None:
+        stats = self.data_lake.summary()
+        last = local_time(stats["last_success"]) if stats["last_success"] else "Never"
+        status = self.data_lake.connection_status
+        self.sync_status.setText(
+            f"Data Lake · {status}\n"
+            f"Pending {stats['pending']} · Synced {stats['synced']} · Failed {stats['failed']} · Last success {last}"
+        )
+        self.sync_status.setToolTip(stats["last_error"] or status)
 
     def attempt(self, action: Callable[[], None]) -> None:
         try:
@@ -413,5 +471,7 @@ class Window(QMainWindow):
             button.setText(event.label + shortcut)
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self.sync_timer.stop()
+        self.data_lake.stopping.set()
         self.hotkeys.stop()
         super().closeEvent(event)
