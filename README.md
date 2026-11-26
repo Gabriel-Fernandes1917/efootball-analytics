@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # eFootball Analytics 0.1
 
 Windows desktop app for collecting match screenshots and recording their metadata locally, with optional background synchronization to SILO. Capture uses the Windows desktop image exposed through `mss`. Global shortcuts are observed through `pynput`. The app uses ordinary desktop input and display APIs and operates independently of the game process.
